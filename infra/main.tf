@@ -1,8 +1,12 @@
 ########################################
 # infra/main.tf — DEMO (copy-paste)
-# - Creates VPC (public subnets)
-# - Creates ECR repo
-# - Creates EKS cluster (no KMS & no CW log group to avoid DCE guardrails)
+# Creates:
+#   - VPC (2 public subnets)
+#   - ECR repo (demo-app)
+#   - EKS cluster (1 node)
+# Notes:
+#   - KMS & CW log group disabled to avoid org guardrails and re-run collisions
+#   - cluster_name is a variable so we can pass a unique value from GitHub Actions
 ########################################
 
 terraform {
@@ -13,11 +17,18 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"  # <-- change if you need a different region
+  region = "us-east-1"  # change if you need; also update workflow env
 }
 
+# -------- variables --------
+variable "cluster_name" {
+  description = "EKS cluster name (injected by GitHub Actions)"
+  type        = string
+  default     = "demo-eks"
+}
+
+# -------- locals (optional naming helpers) --------
 locals {
-  name   = "demo"
   region = "us-east-1"
 }
 
@@ -28,7 +39,7 @@ module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "5.8.1"
 
-  name = "${local.name}-vpc"
+  name = "demo-vpc"
   cidr = "10.0.0.0/16"
 
   azs            = ["${local.region}a", "${local.region}b"]
@@ -55,9 +66,12 @@ module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "20.24.0"
 
-  cluster_name                   = "demo-eks"
+  cluster_name                   = var.cluster_name
   cluster_version                = "1.29"
   cluster_endpoint_public_access = true
+
+  # Ensure cluster creator (the IAM principal used by Actions) is an admin
+  enable_cluster_creator_admin_permissions = true
 
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.public_subnets
@@ -74,13 +88,11 @@ module "eks" {
 
   enable_irsa = false
 
-  # —— IMPORTANT: Avoid DCE KMS policy restrictions
+  # Avoid KMS policy issues and CW log group collisions
   create_kms_key             = false
   cluster_encryption_config  = []
-
-  # —— Avoid CloudWatch log group collisions when re-running without state
   create_cloudwatch_log_group = false
-  cluster_enabled_log_types   = []  # don't enable control plane logging for demo
+  cluster_enabled_log_types   = []
 }
 
 # ------------------------------
