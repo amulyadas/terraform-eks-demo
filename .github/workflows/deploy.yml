@@ -1,20 +1,80 @@
 name: demo-eks-ci
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   push:
     branches: ["main"]
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-east-1     # <-- change if your region changes
   EKS_CLUSTER: demo-eks
   ECR_REPO: demo-app
   NAMESPACE: default
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
 
   terraform:
+    name: Terraform Infra
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  # leave empty if not using STS
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: infra
+        run: terraform init -upgrade
+
+      # ✅ Pre-clean to avoid "already exists" when state is ephemeral on runner
+      - name: Pre-clean ECR repo & residual CW log group (safe/idempotent)
+        env:
+          AWS_REGION:  ${{ env.AWS_REGION }}
+          ECR_REPO:    ${{ env.ECR_REPO }}
+          EKS_CLUSTER: ${{ env.EKS_CLUSTER }}
+        run: |
+          set -e
+
+          echo "Checking for existing ECR repo: $ECR_REPO"
+          if aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "ECR repo exists. Deleting it so Terraform can own it..."
+            aws ecr delete-repository --repository-name "$ECR_REPO" --force --region "$AWS_REGION" || true
+          else
+            echo "ECR repo not found; nothing to delete."
+          fi
+
+          # We disabled CW log group creation in TF, but if a previous run created it, remove it.
+          if aws logs describe-log-groups --log-group-name-prefix "/aws/eks/${EKS_CLUSTER}/cluster" --region "$AWS_REGION" \
+             | grep -q "/aws/eks/${EKS_CLUSTER}/cluster"; then
+            echo "Deleting existing CW log group /aws/eks/${EKS_CLUSTER}/cluster ..."
+            aws logs delete-log-group --log-group-name "/aws/eks/${EKS_CLUSTER}/cluster" --region "$AWS_REGION" || true
+          else
+            echo "No CW log group to delete."
+          fi
+
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -auto-approve
+
+  build_and_push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: terraform
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,70 +86,73 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform init
-        run: terraform init
-        working-directory: infra
-
-      - name: Terraform apply
-        run: terraform apply -auto-approve
-        working-directory: infra
-
-  build_and_push:
-    runs-on: ubuntu-latest
-    needs: terraform
-    outputs:
-      image_uri: ${{ steps.push.outputs.image_uri }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v1
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build & Push
         id: push
+        env:
+          REGISTRY:  ${{ steps.ecr.outputs.registry }}
+          IMAGE_TAG: latest   # for demo; you can switch to ${{ github.sha }}
         run: |
-          IMAGE_URI="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest"
+          IMAGE_URI="$REGISTRY/${{ env.ECR_REPO }}:$IMAGE_TAG"
+          echo "Building image: $IMAGE_URI"
           docker build -t "$IMAGE_URI" ./app
           docker push "$IMAGE_URI"
           echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
 
   deploy:
+    name: Install Ingress & Deploy App
     runs-on: ubuntu-latest
     needs: build_and_push
     steps:
       - uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - uses: azure/setup-kubectl@v4
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.6"
 
       - name: Update kubeconfig
-        run: aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+        run: aws eks update-kubeconfig --name "${{ env.EKS_CLUSTER }}" --region "${{ env.AWS_REGION }}"
 
-      - name: Install nginx ingress
+      # Install NGINX Ingress using static manifest (no Helm)
+      - name: Install ingress-nginx (no Helm)
         run: |
+          set -e
           kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/aws/deploy.yaml
-          kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=600s
+          kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=900s
 
-      - name: Deploy app
+      # (Optional) wait for at least one Ready node (sometimes cluster is slow right after creation)
+      - name: Wait for nodes Ready
         run: |
-          sed "s|REPLACE_IMAGE|${{ needs.build_and_push.outputs.image_uri }}|g" app/k8s/deployment.yaml | kubectl apply -f -
-          kubectl apply -f app/k8s/service.yaml
-          kubectl apply -f app/k8s/ingress.yaml
+          for i in {1..30}; do
+            READY=$(kubectl get nodes --no-headers 2>/dev/null | awk '{print $2}' | grep -c 'Ready' || true)
+            if [ "$READY" -ge 1 ]; then echo "Node is Ready"; break; fi
+            echo "Waiting for Ready node... ($i/30)"; sleep 10
+          done
 
-      - name: Rollout status
-        run: kubectl rollout status deployment/demo-app
+      - name: Deploy Kubernetes Manifests (image substitution)
+        env:
+          IMAGE_URI: ${{ needs.build_and_push.outputs.image_uri }}
+        run: |
+          sed "s|REPLACE_IMAGE|$IMAGE_URI|g" app/k8s/deployment.yaml | kubectl apply -n "${{ env.NAMESPACE }}" -f -
+          kubectl apply -n "${{ env.NAMESPACE }}" -f app/k8s/service.yaml
+          kubectl apply -n "${{ env.NAMESPACE }}" -f app/k8s/ingress.yaml
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/demo-app -n "${{ env.NAMESPACE }}" --timeout=600s
+
+      - name: Show ingress & NGINX LB
+        run: |
+          kubectl get ingress -n "${{ env.NAMESPACE }}"
+          kubectl get svc -n ingress-nginx

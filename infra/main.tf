@@ -2,7 +2,7 @@
 # infra/main.tf — DEMO (copy-paste)
 # - Creates VPC (public subnets)
 # - Creates ECR repo
-# - Creates EKS cluster (no KMS to avoid DCE restrictions)
+# - Creates EKS cluster (no KMS & no CW log group to avoid DCE guardrails)
 ########################################
 
 terraform {
@@ -13,7 +13,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = "us-east-1"  # <-- change if you need a different region
 }
 
 locals {
@@ -49,7 +49,7 @@ resource "aws_ecr_repository" "demo" {
 }
 
 # ------------------------------
-# EKS cluster (KMS disabled for demo)
+# EKS cluster (KMS & CW logs disabled for demo)
 # ------------------------------
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
@@ -74,9 +74,13 @@ module "eks" {
 
   enable_irsa = false
 
-  # —— IMPORTANT: Skip KMS to avoid DCE key-policy restrictions
-  create_kms_key            = false
-  cluster_encryption_config = []
+  # —— IMPORTANT: Avoid DCE KMS policy restrictions
+  create_kms_key             = false
+  cluster_encryption_config  = []
+
+  # —— Avoid CloudWatch log group collisions when re-running without state
+  create_cloudwatch_log_group = false
+  cluster_enabled_log_types   = []  # don't enable control plane logging for demo
 }
 
 # ------------------------------
