@@ -1,36 +1,46 @@
 ########################################
-# infra/main.tf — FINAL ERROR-FREE VERSION
-# Uses DEFAULT VPC and ALL its subnets (no slice)
+# infra/main.tf — FINAL (no IAM created)
+# - Uses DEFAULT VPC (avoids VPC quota)
+# - Uses ALL default subnets (no slice errors)
+# - Tags subnets for EKS/ELB
+# - Plain resources (aws_eks_cluster/node_group) using PRE-APPROVED IAM ROLES
+# - S3 backend is configured at init from the workflow (backend args passed there)
 ########################################
 
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
+    aws = { source = "hashicorp/aws", version = "~> 5.0" }
   }
+  # Backend arguments are passed by the workflow with -backend-config=...
+  backend "s3" {}
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = "us-east-1"  # keep in sync with the workflow
 }
 
-# Cluster name passed from GitHub Actions
+# ---------- Variables injected from the workflow ----------
 variable "cluster_name" {
   description = "EKS cluster name"
   type        = string
 }
 
-# --------------------------
-# USE DEFAULT VPC
-# --------------------------
+variable "cluster_role_arn" {
+  description = "Pre-approved IAM Role ARN for EKS Cluster (must have AmazonEKSClusterPolicy)"
+  type        = string
+}
+
+variable "node_role_arn" {
+  description = "Pre-approved IAM Role ARN for EKS Managed Node Group (must have AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, AmazonEC2ContainerRegistryReadOnly)"
+  type        = string
+}
+
+# ---------- Use the DEFAULT VPC ----------
 data "aws_vpc" "default" {
   default = true
 }
 
-# All subnets of default VPC
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
@@ -38,14 +48,12 @@ data "aws_subnets" "default" {
   }
 }
 
-# No slicing here → ZERO syntax issues!
+# Use all subnets (public by default in the default VPC)
 locals {
   subnets = data.aws_subnets.default.ids
 }
 
-# --------------------------
-# TAG SUBNETS FOR EKS + ELB
-# --------------------------
+# ---------- Tag subnets so EKS/ELB can use them ----------
 resource "aws_ec2_tag" "subnet_cluster" {
   for_each    = toset(local.subnets)
   resource_id = each.value
@@ -60,47 +68,49 @@ resource "aws_ec2_tag" "subnet_public_elb" {
   value       = "1"
 }
 
-# --------------------------
-# ECR
-# --------------------------
+# ---------- ECR (demo repo) ----------
 resource "aws_ecr_repository" "demo" {
-  name = "demo-app"
+  name                 = "demo-app"
   image_tag_mutability = "MUTABLE"
 }
 
-# --------------------------
-# EKS CLUSTER
-# --------------------------
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "20.24.0"
+# ---------- EKS CLUSTER (NO KMS / NO CW control-plane logs) ----------
+resource "aws_eks_cluster" "this" {
+  name     = var.cluster_name
+  role_arn = var.cluster_role_arn
 
-  cluster_name                   = var.cluster_name
-  cluster_version                = "1.29"
-  cluster_endpoint_public_access = true
-  enable_cluster_creator_admin_permissions = true
+  version = "1.29"
 
-  vpc_id     = data.aws_vpc.default.id
-  subnet_ids = local.subnets
-
-  eks_managed_node_groups = {
-    demo = {
-      instance_types = ["t3.medium"]
-      desired_size   = 1
-      min_size       = 1
-      max_size       = 1
-    }
+  vpc_config {
+    subnet_ids = local.subnets
+    endpoint_private_access = false
+    endpoint_public_access  = true
   }
 
-  enable_irsa = false
-
-  # Disable features blocked by org policies
-  create_kms_key            = false
-  cluster_encryption_config = []
-  create_cloudwatch_log_group = false
-  cluster_enabled_log_types   = []
+  enabled_cluster_log_types = [] # disabled to avoid CW log group collisions
 }
 
-output "cluster_name" {
-  value = module.eks.cluster_name
+# ---------- EKS MANAGED NODE GROUP (uses existing node role) ----------
+resource "aws_eks_node_group" "default" {
+  cluster_name    = aws_eks_cluster.this.name
+  node_group_name = "demo"
+  node_role_arn   = var.node_role_arn
+  subnet_ids      = local.subnets
+  ami_type        = "AL2_x86_64"
+  capacity_type   = "ON_DEMAND"
+  instance_types  = ["t3.medium"]
+
+  scaling_config {
+    desired_size = 1
+    min_size     = 1
+    max_size     = 1
+  }
+
+  depends_on = [aws_eks_cluster.this]
 }
+
+# ---------- Outputs ----------
+output "cluster_name"   { value = aws_eks_cluster.this.name }
+output "ecr_repo_url"   { value = aws_ecr_repository.demo.repository_url }
+output "default_vpc_id" { value = data.aws_vpc.default.id }
+output "subnets_used"   { value = local.subnets }
