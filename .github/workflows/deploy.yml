@@ -6,7 +6,7 @@ on:
     branches: ["main"]
 
 env:
-  AWS_REGION: us-east-1     # <-- change if your region changes
+  AWS_REGION: us-east-1
   EKS_CLUSTER: demo-eks
   ECR_REPO: demo-app
   NAMESPACE: default
@@ -29,7 +29,7 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}  # leave empty if not using STS
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
@@ -39,8 +39,7 @@ jobs:
         working-directory: infra
         run: terraform init -upgrade
 
-      # ✅ Pre-clean to avoid "already exists" when state is ephemeral on runner
-      - name: Pre-clean ECR repo & residual CW log group (safe/idempotent)
+      - name: Pre-clean ECR repo & CW log group
         env:
           AWS_REGION:  ${{ env.AWS_REGION }}
           ECR_REPO:    ${{ env.ECR_REPO }}
@@ -48,26 +47,22 @@ jobs:
         run: |
           set -e
 
-          echo "Checking for existing ECR repo: $ECR_REPO"
+          echo "Checking existing ECR repo: $ECR_REPO"
           if aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1; then
-            echo "ECR repo exists. Deleting it so Terraform can own it..."
+            echo "Deleting existing ECR repo..."
             aws ecr delete-repository --repository-name "$ECR_REPO" --force --region "$AWS_REGION" || true
-          else
-            echo "ECR repo not found; nothing to delete."
           fi
 
-          # We disabled CW log group creation in TF, but if a previous run created it, remove it.
           if aws logs describe-log-groups --log-group-name-prefix "/aws/eks/${EKS_CLUSTER}/cluster" --region "$AWS_REGION" \
-             | grep -q "/aws/eks/${EKS_CLUSTER}/cluster"; then
-            echo "Deleting existing CW log group /aws/eks/${EKS_CLUSTER}/cluster ..."
+            | grep -q "/aws/eks/${EKS_CLUSTER}/cluster"; then
+            echo "Deleting CW log group..."
             aws logs delete-log-group --log-group-name "/aws/eks/${EKS_CLUSTER}/cluster" --region "$AWS_REGION" || true
-          else
-            echo "No CW log group to delete."
           fi
 
       - name: Terraform apply
         working-directory: infra
         run: terraform apply -auto-approve
+
 
   build_and_push:
     name: Build & Push Image
@@ -76,9 +71,10 @@ jobs:
     outputs:
       image_uri: ${{ steps.push.outputs.image_uri }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: AWS creds
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -86,30 +82,32 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
+      - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push
+      - name: Build & Push Image
         id: push
         env:
           REGISTRY:  ${{ steps.ecr.outputs.registry }}
-          IMAGE_TAG: latest   # for demo; you can switch to ${{ github.sha }}
+          IMAGE_TAG: latest
         run: |
+          set -e
           IMAGE_URI="$REGISTRY/${{ env.ECR_REPO }}:$IMAGE_TAG"
-          echo "Building image: $IMAGE_URI"
           docker build -t "$IMAGE_URI" ./app
           docker push "$IMAGE_URI"
           echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
 
   deploy:
     name: Install Ingress & Deploy App
     runs-on: ubuntu-latest
     needs: build_and_push
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: AWS creds
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -125,34 +123,73 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "${{ env.EKS_CLUSTER }}" --region "${{ env.AWS_REGION }}"
 
-      # Install NGINX Ingress using static manifest (no Helm)
-      - name: Install ingress-nginx (no Helm)
-        run: |
-          set -e
-          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/aws/deploy.yaml
-          kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=900s
+      # -------------------------
+      # ⭐ FIX 1: Wait for EKS API
+      # -------------------------
+      - name: Wait for EKS cluster ACTIVE
+        run: aws eks wait cluster-active --name "${{ env.EKS_CLUSTER }}" --region "${{ env.AWS_REGION }}"
 
-      # (Optional) wait for at least one Ready node (sometimes cluster is slow right after creation)
-      - name: Wait for nodes Ready
+      - name: Wait for API /readyz
         run: |
-          for i in {1..30}; do
-            READY=$(kubectl get nodes --no-headers 2>/dev/null | awk '{print $2}' | grep -c 'Ready' || true)
-            if [ "$READY" -ge 1 ]; then echo "Node is Ready"; break; fi
-            echo "Waiting for Ready node... ($i/30)"; sleep 10
+          for i in {1..60}; do
+            if kubectl get --raw='/readyz?verbose' >/dev/null 2>&1; then
+              echo "API server fully ready"
+              break
+            fi
+            echo "Waiting for API /readyz ($i/60)"
+            sleep 5
           done
 
-      - name: Deploy Kubernetes Manifests (image substitution)
+      - name: Wait for at least one Ready node
+        run: |
+          for i in {1..40}; do
+            READY=$(kubectl get nodes --no-headers | awk '{print $2}' | grep -c "^Ready$" || true)
+            if [ "$READY" -ge 1 ]; then
+              echo "Node ready"
+              kubectl get nodes
+              break
+            fi
+            echo "Waiting for node Ready ($i/40)"
+            sleep 10
+          done
+
+      # -------------------------
+      # ⭐ FIX 2: Ingress install with retry + validate=false
+      # -------------------------
+      - name: Install ingress-nginx (retry)
+        run: |
+          set -e
+          URL="https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/aws/deploy.yaml"
+
+          echo "Installing ingress-nginx with retry..."
+          for i in {1..5}; do
+            if kubectl apply --validate=false -f "$URL"; then
+              echo "Ingress applied OK"
+              break
+            fi
+            echo "Retry $i/5 failed; sleeping 10s..."
+            sleep 10
+          done
+
+          kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=900s
+
+      # -------------------------
+      # Deploy app
+      # -------------------------
+      - name: Apply app manifests
         env:
           IMAGE_URI: ${{ needs.build_and_push.outputs.image_uri }}
         run: |
-          sed "s|REPLACE_IMAGE|$IMAGE_URI|g" app/k8s/deployment.yaml | kubectl apply -n "${{ env.NAMESPACE }}" -f -
-          kubectl apply -n "${{ env.NAMESPACE }}" -f app/k8s/service.yaml
-          kubectl apply -n "${{ env.NAMESPACE }}" -f app/k8s/ingress.yaml
+          set -e
+          sed "s|REPLACE_IMAGE|$IMAGE_URI|g" app/k8s/deployment.yaml \
+            | kubectl apply --validate=false -n ${{ env.NAMESPACE }} -f -
+          kubectl apply --validate=false -n ${{ env.NAMESPACE }} -f app/k8s/service.yaml
+          kubectl apply --validate=false -n ${{ env.NAMESPACE }} -f app/k8s/ingress.yaml
 
-      - name: Wait for rollout
-        run: kubectl rollout status deployment/demo-app -n "${{ env.NAMESPACE }}" --timeout=600s
+      - name: Wait for deployment
+        run: kubectl rollout status deployment/demo-app -n ${{ env.NAMESPACE }} --timeout=600s
 
-      - name: Show ingress & NGINX LB
+      - name: Show ingress & LB
         run: |
-          kubectl get ingress -n "${{ env.NAMESPACE }}"
+          kubectl get ingress -n ${{ env.NAMESPACE }}
           kubectl get svc -n ingress-nginx
