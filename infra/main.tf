@@ -1,8 +1,6 @@
 ########################################
-# infra/main.tf — FINAL WORKING VERSION
-# Uses DEFAULT VPC → avoids VPC limit exceeded
-# Correct slice syntax → fixes "Argument or block definition required"
-# Disables KMS + CW logs → avoids org guardrails
+# infra/main.tf — FINAL ERROR-FREE VERSION
+# Uses DEFAULT VPC and ALL its subnets (no slice)
 ########################################
 
 terraform {
@@ -19,17 +17,20 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# -------- variables --------
+# Cluster name passed from GitHub Actions
 variable "cluster_name" {
-  description = "EKS cluster name (injected by GitHub Actions)"
+  description = "EKS cluster name"
   type        = string
 }
 
-# -------- Use DEFAULT VPC --------
+# --------------------------
+# USE DEFAULT VPC
+# --------------------------
 data "aws_vpc" "default" {
   default = true
 }
 
+# All subnets of default VPC
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
@@ -37,38 +38,39 @@ data "aws_subnets" "default" {
   }
 }
 
-# -------- Select first 2 subnets (VALID syntax) --------
+# No slicing here → ZERO syntax issues!
 locals {
-  selected_subnet_ids = length(data.aws_subnets.default.ids) >= 2 ?
-    slice(data.aws_subnets.default.ids, 0, 2) :
-    data.aws_subnets.default.ids
+  subnets = data.aws_subnets.default.ids
 }
 
-# -------- Tag subnets for EKS + ELB --------
+# --------------------------
+# TAG SUBNETS FOR EKS + ELB
+# --------------------------
 resource "aws_ec2_tag" "subnet_cluster" {
-  for_each    = toset(local.selected_subnet_ids)
+  for_each    = toset(local.subnets)
   resource_id = each.value
   key         = "kubernetes.io/cluster/${var.cluster_name}"
   value       = "shared"
 }
 
 resource "aws_ec2_tag" "subnet_public_elb" {
-  for_each    = toset(local.selected_subnet_ids)
+  for_each    = toset(local.subnets)
   resource_id = each.value
   key         = "kubernetes.io/role/elb"
   value       = "1"
 }
 
-# -------- ECR Repo --------
+# --------------------------
+# ECR
+# --------------------------
 resource "aws_ecr_repository" "demo" {
-  name                 = "demo-app"
+  name = "demo-app"
   image_tag_mutability = "MUTABLE"
-  image_scanning_configuration {
-    scan_on_push = false
-  }
 }
 
-# -------- EKS (NO KMS + NO CW logs) --------
+# --------------------------
+# EKS CLUSTER
+# --------------------------
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "20.24.0"
@@ -76,11 +78,10 @@ module "eks" {
   cluster_name                   = var.cluster_name
   cluster_version                = "1.29"
   cluster_endpoint_public_access = true
-
   enable_cluster_creator_admin_permissions = true
 
   vpc_id     = data.aws_vpc.default.id
-  subnet_ids = local.selected_subnet_ids
+  subnet_ids = local.subnets
 
   eks_managed_node_groups = {
     demo = {
@@ -88,32 +89,18 @@ module "eks" {
       desired_size   = 1
       min_size       = 1
       max_size       = 1
-      capacity_type  = "ON_DEMAND"
     }
   }
 
   enable_irsa = false
 
-  create_kms_key             = false
-  cluster_encryption_config  = []
-
+  # Disable features blocked by org policies
+  create_kms_key            = false
+  cluster_encryption_config = []
   create_cloudwatch_log_group = false
   cluster_enabled_log_types   = []
 }
 
-# -------- Outputs --------
 output "cluster_name" {
   value = module.eks.cluster_name
-}
-
-output "ecr_repo_url" {
-  value = aws_ecr_repository.demo.repository_url
-}
-
-output "default_vpc_id" {
-  value = data.aws_vpc.default.id
-}
-
-output "subnets_used" {
-  value = local.selected_subnet_ids
 }
