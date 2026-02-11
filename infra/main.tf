@@ -1,12 +1,13 @@
 ########################################
-# infra/main.tf — DEMO (copy-paste)
+# infra/main.tf — DEMO (uses DEFAULT VPC to avoid VPC quota)
 # Creates:
-#   - VPC (2 public subnets)
 #   - ECR repo (demo-app)
-#   - EKS cluster (1 node)
+#   - EKS cluster (1 node) in DEFAULT VPC public subnets
 # Notes:
+#   - No new VPC created (bypasses VpcLimitExceeded)
+#   - Auto-tags default VPC subnets for EKS/ELB usage
 #   - KMS & CW log group disabled to avoid org guardrails and re-run collisions
-#   - cluster_name is a variable so we can pass a unique value from GitHub Actions
+#   - cluster_name is provided via TF_VAR_cluster_name from GitHub Actions
 ########################################
 
 terraform {
@@ -17,7 +18,7 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"  # change if you need; also update workflow env
+  region = "us-east-1"  # change if you need; also update the workflow env
 }
 
 # -------- variables --------
@@ -27,27 +28,40 @@ variable "cluster_name" {
   default     = "demo-eks"
 }
 
-# -------- locals (optional naming helpers) --------
-locals {
-  region = "us-east-1"
+# -------- use the DEFAULT VPC --------
+data "aws_vpc" "default" {
+  default = true
 }
 
-# ------------------------------
-# VPC (public subnets for demo)
-# ------------------------------
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "5.8.1"
+# All subnets in default VPC
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
 
-  name = "demo-vpc"
-  cidr = "10.0.0.0/16"
+# Pick first two subnets for demo (default VPC subnets are public by default)
+locals {
+  selected_subnet_ids = length(data.aws_subnets.default.ids) >= 2
+    ? slice(data.aws_subnets.default.ids, 0, 2)
+    : data.aws_subnets.default.ids
+}
 
-  azs            = ["${local.region}a", "${local.region}b"]
-  public_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
+# -------- Tag subnets so EKS can create ELBs & identify cluster --------
+# Tag ALL selected subnets with cluster + public ELB role
+resource "aws_ec2_tag" "subnet_cluster" {
+  for_each    = toset(local.selected_subnet_ids)
+  resource_id = each.value
+  key         = "kubernetes.io/cluster/${var.cluster_name}"
+  value       = "shared"
+}
 
-  enable_dns_support      = true
-  enable_dns_hostnames    = true
-  map_public_ip_on_launch = true
+resource "aws_ec2_tag" "subnet_public_elb" {
+  for_each    = toset(local.selected_subnet_ids)
+  resource_id = each.value
+  key         = "kubernetes.io/role/elb"
+  value       = "1"
 }
 
 # ------------------------------
@@ -70,11 +84,11 @@ module "eks" {
   cluster_version                = "1.29"
   cluster_endpoint_public_access = true
 
-  # Ensure cluster creator (the IAM principal used by Actions) is an admin
+  # Give the creator (your GH Actions principal) admin
   enable_cluster_creator_admin_permissions = true
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.public_subnets
+  vpc_id     = data.aws_vpc.default.id
+  subnet_ids = local.selected_subnet_ids
 
   eks_managed_node_groups = {
     demo = {
@@ -88,9 +102,11 @@ module "eks" {
 
   enable_irsa = false
 
-  # Avoid KMS policy issues and CW log group collisions
-  create_kms_key             = false
-  cluster_encryption_config  = []
+  # Avoid DCE KMS policy restrictions
+  create_kms_key            = false
+  cluster_encryption_config = []
+
+  # Avoid CW log group collisions on re-runs without TF state
   create_cloudwatch_log_group = false
   cluster_enabled_log_types   = []
 }
@@ -106,6 +122,10 @@ output "ecr_repo_url" {
   value = aws_ecr_repository.demo.repository_url
 }
 
-output "region" {
-  value = local.region
+output "vpc_id" {
+  value = data.aws_vpc.default.id
+}
+
+output "subnet_ids" {
+  value = local.selected_subnet_ids
 }

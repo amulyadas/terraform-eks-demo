@@ -5,9 +5,9 @@ on:
   push:
     branches: ["main"]
 
-# Top-level env: keep only static values here (no expressions)
+# Top-level env: only static values
 env:
-  AWS_REGION: us-east-1          # change if you changed in infra/main.tf
+  AWS_REGION: us-east-1
   ECR_REPO: demo-app
   NAMESPACE: default
 
@@ -30,13 +30,12 @@ jobs:
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}   # leave blank if not using STS
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # ✅ Compute dynamic values INSIDE the job and export to env
       - name: Set dynamic variables (EKS cluster name + TF var)
         run: |
           echo "EKS_CLUSTER=demo-eks-${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
@@ -47,7 +46,6 @@ jobs:
         working-directory: infra
         run: terraform init -upgrade
 
-      # Because runner has no persistent state, clean collisions safely
       - name: Pre-clean ECR repo & residual CW log group
         env:
           AWS_REGION:  ${{ env.AWS_REGION }}
@@ -68,7 +66,6 @@ jobs:
 
       - name: Terraform apply
         working-directory: infra
-        # TF_VAR_cluster_name is already exported in this job's env
         run: terraform apply -auto-approve
 
 
@@ -91,7 +88,6 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      # ✅ Recompute cluster name in THIS job too (jobs don't share GITHUB_ENV)
       - name: Set dynamic variables (EKS cluster name)
         run: |
           echo "EKS_CLUSTER=demo-eks-${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
@@ -105,7 +101,7 @@ jobs:
         id: push
         env:
           REGISTRY:  ${{ steps.ecr.outputs.registry }}
-          IMAGE_TAG: latest    # for demo; prefer ${{ github.sha }} for immutable tags
+          IMAGE_TAG: latest
         run: |
           set -e
           IMAGE_URI="$REGISTRY/${{ env.ECR_REPO }}:$IMAGE_TAG"
@@ -131,7 +127,6 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      # ✅ Recompute cluster name here too
       - name: Set dynamic variables (EKS cluster name)
         run: |
           echo "EKS_CLUSTER=demo-eks-${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
@@ -145,7 +140,6 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "${EKS_CLUSTER}" --region "${{ env.AWS_REGION }}"
 
-      # --- Wait for control plane and nodes ---
       - name: Wait for EKS cluster ACTIVE
         run: aws eks wait cluster-active --name "${EKS_CLUSTER}" --region "${{ env.AWS_REGION }}"
 
@@ -173,12 +167,10 @@ jobs:
             sleep 10
           done
 
-      # --- Install ingress-nginx with retries; skip OpenAPI validation ---
       - name: Install ingress-nginx (retry)
         run: |
           set -e
           URL="https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/aws/deploy.yaml"
-
           echo "Installing ingress-nginx with retry..."
           for i in {1..5}; do
             if kubectl apply --validate=false -f "$URL"; then
@@ -188,7 +180,6 @@ jobs:
             echo "Retry $i/5 failed; sleeping 10s..."
             sleep 10
           done
-
           kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=900s
 
       - name: Deploy app manifests
